@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react'
+import DiagnosisPanel from './DiagnosisPanel.jsx'
 
 const API = '/api'
 const COLORS = { up: '#e8393a', down: '#17c183', neutral: '#888' }
@@ -39,24 +40,29 @@ const Tag = ({ label, type }) => {
 
 // ── Market Bar ──
 function MarketBar({ data, loading }) {
-  const indices = [
-    { key: 'shanghai', label: '上证指数' },
-    { key: 'shenzhen', label: '深证成指' },
-    { key: 'chinext', label: '创业板指' },
-  ]
+  const primaryIndices = ['sh_idx', 'sz_idx', 'cy_idx']
+  const secondaryIndices = ['hs300_idx', 'zz500_idx', 'kc50_idx', 'sz50_idx']
+
+  const renderIdx = (item) => (
+    <span key={item.key} className="index-item">
+      <span className="idx-name">{item.name}</span>
+      <span className="idx-price">{loading ? '—' : (item.price || 0).toLocaleString()}</span>
+    </span>
+  )
+
+  // Handle both old (dict) and new (list) API formats
+  const idxList = Array.isArray(data) ? data : []
+  const primaries = idxList.filter(d => primaryIndices.includes(d.key))
+  const secondaries = idxList.filter(d => secondaryIndices.includes(d.key))
+
   return (
     <div className="market-bar">
       <div className="market-bar-inner">
         <span className="brand">📊 A股异动复盘助手</span>
         <div className="indices">
-          {indices.map(({ key, label }) => (
-            <span key={key} className="index-item">
-              <span className="idx-name">{label}</span>
-              <span className="idx-price">
-                {loading ? '—' : fmt(data[key]?.price || 0)}
-              </span>
-            </span>
-          ))}
+          {primaries.map(renderIdx)}
+          <span className="idx-sep">|</span>
+          {secondaries.map(renderIdx)}
         </div>
         <span className="update-time">实时数据</span>
       </div>
@@ -66,10 +72,11 @@ function MarketBar({ data, loading }) {
 
 // ── Tab Bar ──
 const TABS = [
+  { key: 'diagnosis', label: '📋 个股诊断', icon: '' },
   { key: 'gainers', label: '🔥 涨幅榜', icon: '' },
   { key: 'sectors', label: '📂 板块榜', icon: '' },
   { key: 'volume', label: '📈 放量异动', icon: '' },
-  { key: 'review', label: '📋 每日复盘', icon: '' },
+  { key: 'review', label: '📊 每日复盘', icon: '' },
   { key: 'strategies', label: '🎯 策略筛选', icon: '' },
   { key: 'watchlist', label: '⭐ 自选股', icon: '' },
 ]
@@ -236,6 +243,7 @@ function StrategyPanel() {
   const [strategy, setStrategy] = useState('low_volume_breakout')
   const [data, setData] = useState([])
   const [loading, setLoading] = useState(false)
+  const [backtestData, setBacktestData] = useState(null)
 
   const fetchData = useCallback(async (st) => {
     setLoading(true)
@@ -248,6 +256,13 @@ function StrategyPanel() {
   }, [])
 
   useEffect(() => { fetchData(strategy) }, [strategy])
+
+  // Fetch backtest data for win rate display
+  useEffect(() => {
+    fetch('/api/backtest').then(r => r.json()).then(d => {
+      if (!d.error) setBacktestData(d.strategies)
+    }).catch(() => {})
+  }, [])
 
   const cols = [
     { key: 'code', label: '代码' },
@@ -265,23 +280,47 @@ function StrategyPanel() {
     : undefined,
   }))
 
+  const btForStrategy = backtestData?.[strategy]
+  const currentBt = btForStrategy || {}
+
   return (
     <div>
       <div className="strategy-tabs">
-        {STRATEGY_TEMPLATES.map((s) => (
-          <button
-            key={s.key}
-            className={`strategy-btn ${strategy === s.key ? 'active' : ''}`}
-            onClick={() => setStrategy(s.key)}
-            title={s.desc}
-          >
-            {s.name}
-          </button>
-        ))}
+        {STRATEGY_TEMPLATES.map((s) => {
+          const bt = backtestData?.[s.key]
+          const wr = bt?.overall_win_rate_t5
+          return (
+            <button
+              key={s.key}
+              className={`strategy-btn ${strategy === s.key ? 'active' : ''}`}
+              onClick={() => setStrategy(s.key)}
+              title={s.desc}
+            >
+              {s.name}
+              {wr != null && <span className="strategy-wr" style={{color: wr>=50?'#34d399':wr>=40?'#fbbf24':'#f87171'}}> {wr}%</span>}
+            </button>
+          )
+        })}
       </div>
       <p className="strategy-desc">
         {STRATEGY_TEMPLATES.find(s => s.key === strategy)?.desc} — 共 {data.length} 只
       </p>
+      {btForStrategy && currentBt.total_signals > 0 && (
+        <div className="bt-stats-bar">
+          <span>📊 历史回测: <strong>{currentBt.total_signals}</strong> 次信号</span>
+          <span>T+5胜率: <strong style={{color:currentBt.overall_win_rate_t5>=50?'#34d399':'#fbbf24'}}>{currentBt.overall_win_rate_t5}%</strong></span>
+          <span>平均收益: <strong style={{color:currentBt.overall_avg_ret_t5>0?'#e8393a':'#17c183'}}>{currentBt.overall_avg_ret_t5>0?'+':''}{currentBt.overall_avg_ret_t5}%</strong></span>
+          {currentBt.by_state && (
+            <div className="bt-state-grid">
+              {Object.entries(currentBt.by_state).map(([state, d]) => (
+                <span key={state} className="bt-state-item" title={`${state}市场: ${d.signals}次信号, T+5胜率${d.win_rate_t5}%`}>
+                  {state}: {d.win_rate_t5}%
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
       <StockTable data={data} loading={loading} columns={cols} riskTags={false} />
     </div>
   )
@@ -444,8 +483,8 @@ function StockDetail({ code, onClose }) {
 //  MAIN APP
 // ═══════════════════════════════════
 export default function App() {
-  const [activeTab, setActiveTab] = useState('gainers')
-  const [marketData, setMarketData] = useState({ shanghai: {}, shenzhen: {}, chinext: {} })
+  const [activeTab, setActiveTab] = useState('diagnosis')
+  const [marketData, setMarketData] = useState([])
   const [marketLoading, setMarketLoading] = useState(true)
   const [gainers, setGainers] = useState([])
   const [gainersLoading, setGainersLoading] = useState(true)
@@ -541,6 +580,9 @@ export default function App() {
         </div>
 
         <div className="content-area">
+          {activeTab === 'diagnosis' && (
+            <DiagnosisPanel />
+          )}
           {activeTab === 'gainers' && (
             <StockTable data={gainers} loading={gainersLoading} columns={gainerCols} onSelect={setSelectedStock} riskTags={true} />
           )}

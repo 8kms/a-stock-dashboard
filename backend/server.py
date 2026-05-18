@@ -2,10 +2,22 @@
 A股异动复盘助手 — Flask Backend
 Primary: Direct Eastmoney API  |  Fallback: Realistic mock data
 """
-import json, time, random, requests
+import json, time, random, re, requests
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from report_engine import generate_diagnosis
+try:
+    from data_fetcher import fetch_klines, search_stocks_bs
+except ImportError:
+    fetch_klines = None
+    search_stocks_bs = None
+try:
+    from live_data import get_live_gainers, get_live_volume_anomaly, get_live_indices
+except ImportError:
+    get_live_gainers = None
+    get_live_volume_anomaly = None
+    get_live_indices = None
 
 app = Flask(__name__)
 CORS(app)
@@ -33,7 +45,7 @@ def cached(key, ttl=15):
 
 EM_BASE = 'https://push2.eastmoney.com/api/qt/clist/get'
 EM_HIST = 'https://push2his.eastmoney.com/api/qt/stock/kline/get'
-EM_AVAILABLE = True  # will be set to False if connection fails
+EM_AVAILABLE = False  # set True when Eastmoney API is reachable
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -118,6 +130,11 @@ STOCK_POOL = [
     ('002475', '立讯精密', 32.8, 25.5), ('300059', '东方财富', 22.5, 42.0),
     ('601888', '中国中免', 72.5, 28.0), ('000725', '京东方A', 4.35, 30.5),
     ('002230', '科大讯飞', 48.5, 85.0), ('688981', '中芯国际', 58.2, 45.5),
+    ('688388', '嘉元科技', 38.5, 35.0), ('688005', '容百科技', 42.0, 30.0),
+    ('688012', '中微公司', 185.0, 68.0), ('688111', '金山办公', 425.0, 85.0),
+    ('688036', '传音控股', 128.0, 22.0), ('688561', '奇安信', 32.5, -1.0),
+    ('688169', '石头科技', 325.0, 28.5), ('688008', '澜起科技', 72.5, 58.0),
+    ('688256', '寒武纪', 285.0, -1.0), ('688396', '华润微', 45.8, 38.0),
     ('601688', '华泰证券', 16.5, 12.8), ('300124', '汇川技术', 68.5, 38.0),
     ('000568', '泸州老窖', 168.0, 20.5), ('002142', '宁波银行', 25.8, 7.2),
     ('600048', '保利发展', 9.8, 8.5), ('601919', '中远海控', 14.8, 5.2),
@@ -134,7 +151,8 @@ STOCK_POOL = [
     ('600438', '通威股份', 28.5, 8.2), ('601225', '陕西煤业', 25.8, 6.5),
     ('000002', '万科A', 8.25, 7.8), ('001979', '招商蛇口', 9.85, 18.5),
     ('600031', '三一重工', 18.2, 22.0), ('000425', '徐工机械', 7.85, 15.5),
-    ('603986', '兆易创新', 98.5, 45.0), ('002241', '歌尔股份', 22.8, 28.5),
+    ('603986', '兆易创新', 98.5, 45.0), ('603876', '鼎胜新材', 30.0, 25.0),
+    ('002241', '歌尔股份', 22.8, 28.5),
     ('300433', '蓝思科技', 18.5, 32.0), ('601728', '中国电信', 7.25, -1.0),
     ('600050', '中国联通', 5.85, -1.0), ('600941', '中国移动', 108.5, 16.5),
     ('688396', '华润微', 45.8, 38.0), ('300782', '卓胜微', 85.0, 55.0),
@@ -171,27 +189,46 @@ SECTOR_MAP = {
     '地产': ['万科A', '保利发展', '招商蛇口'],
     '光伏': ['隆基绿能', '通威股份', '阳光电源'],
     '软件': ['恒生电子', '广联达', '中科创达', '奇安信'],
+    '食品饮料': ['贵州茅台', '五粮液', '伊利股份', '泸州老窖', '山西汾酒', '海天味业'],
+    '有色金属': ['紫金矿业', '赣锋锂业', '华友钴业', '嘉元科技'],
+    '国防军工': ['中航沈飞', '航发动力', '中航西飞'],
+    '电力': ['长江电力', '华能水电', '中国核电'],
+    '机械': ['三一重工', '恒立液压', '徐工机械'],
+    '有色金属': ['紫金矿业', '赣锋锂业', '华友钴业', '鼎胜新材', '嘉元科技'],
+    '锂电池': ['宁德时代', '亿纬锂能', '赣锋锂业', '先导智能', '嘉元科技', '鼎胜新材', '容百科技'],
+    '科创板': ['中芯国际', '中微公司', '金山办公', '澜起科技', '寒武纪', '嘉元科技', '容百科技'],
+    '铝业': ['鼎胜新材', '中国铝业', '南山铝业', '明泰铝业'],
 }
 
 # Market state
 _market_state = {
-    'sh_idx': 4150.0 + random.uniform(-30, 30),
-    'sz_idx': 15580.0 + random.uniform(-100, 100),
-    'cy_idx': 3930.0 + random.uniform(-30, 30),
-    'sh_pct': 0, 'sz_pct': 0, 'cy_pct': 0,
+    'sh_idx': 4120.0, 'sz_idx': 15480.0, 'cy_idx': 2510.0,
+    'hs300_idx': 3980.0, 'zz500_idx': 6250.0, 'zz1000_idx': 6850.0,
+    'kc50_idx': 1020.0, 'sz50_idx': 2720.0,
+    'sc50_idx': 1280.0, 'zzhl_idx': 5100.0,
     'sector_bias': random.choice(['AI算力', '新能源', '白酒', '半导体', '汽车', '医药']),
 }
 
+INDEX_CONFIG = [
+    {'key': 'sh_idx',       'name': '上证指数',   'base': 4120,  'vol': 0.8},
+    {'key': 'sz_idx',       'name': '深证成指',   'base': 15480, 'vol': 1.2},
+    {'key': 'cy_idx',       'name': '创业板指',   'base': 2510,  'vol': 1.5},
+    {'key': 'hs300_idx',    'name': '沪深300',    'base': 3980,  'vol': 0.7},
+    {'key': 'zz500_idx',    'name': '中证500',    'base': 6250,  'vol': 1.1},
+    {'key': 'zz1000_idx',   'name': '中证1000',   'base': 6850,  'vol': 1.3},
+    {'key': 'kc50_idx',     'name': '科创50',     'base': 1020,  'vol': 1.8},
+    {'key': 'sz50_idx',     'name': '上证50',     'base': 2720,  'vol': 0.7},
+    {'key': 'sc50_idx',     'name': '双创50',     'base': 1280,  'vol': 1.6},
+    {'key': 'zzhl_idx',     'name': '中证红利',   'base': 5100,  'vol': 0.5},
+]
+
 
 def _update_market_state():
-    """Update mock market prices"""
     ms = _market_state
-    ms['sh_pct'] = random.uniform(-1.5, 1.8)
-    ms['sz_pct'] = random.uniform(-2.0, 2.5)
-    ms['cy_pct'] = random.uniform(-2.5, 3.0)
-    ms['sh_idx'] = round(ms['sh_idx'] * (1 + ms['sh_pct'] / 100), 2)
-    ms['sz_idx'] = round(ms['sz_idx'] * (1 + ms['sz_pct'] / 100), 2)
-    ms['cy_idx'] = round(ms['cy_idx'] * (1 + ms['cy_pct'] / 100), 2)
+    for ic in INDEX_CONFIG:
+        k = ic['key']
+        pct = random.gauss(0, ic['vol'])
+        ms[k] = round(ms.get(k, ic['base']) * (1 + pct / 100), 2)
 
 
 def _gen_mock_stocks():
@@ -255,9 +292,9 @@ def _gen_mock_stocks():
 
 def _gen_mock_sectors(stype='industry'):
     industry_sectors = [
-        '半导体', 'AI算力', '新能源', '白酒', '汽车', '医药', '银行',
+        '白酒', '食品饮料', '半导体', 'AI算力', '新能源', '锂电池', '汽车', '医药', '银行',
         '保险证券', '家电', '消费电子', '通信设备', '光伏', '软件服务',
-        '煤炭石油', '地产', '国防军工', '有色金属', '食品饮料', '电力', '机械',
+        '煤炭石油', '地产', '国防军工', '有色金属', '电力', '机械', '科创板', '铝业',
     ]
     concept_sectors = [
         'ChatGPT概念', 'AIGC', 'CPO', '液冷服务器', '华为产业链',
@@ -285,11 +322,8 @@ def _gen_mock_sectors(stype='industry'):
 
 def _gen_mock_indices():
     ms = _market_state
-    return {
-        'shanghai': {'name': '上证指数', 'price': round(ms['sh_idx'], 2)},
-        'shenzhen': {'name': '深证成指', 'price': round(ms['sz_idx'], 2)},
-        'chinext': {'name': '创业板指', 'price': round(ms['cy_idx'], 2)},
-    }
+    return [{'key': ic['key'], 'name': ic['name'], 'price': round(ms.get(ic['key'], ic['base']), 2)}
+            for ic in INDEX_CONFIG]
 
 
 def compute_risk_tags(stock):
@@ -317,23 +351,12 @@ def compute_risk_tags(stock):
 
 @app.route('/api/market')
 def api_market():
-    global EM_AVAILABLE
-    # Try real data
-    if EM_AVAILABLE:
+    # Try real baostock indices first
+    if get_live_indices:
         try:
-            data = em_indices()
-            if data:
-                diffs = data.get('data', {}).get('diff', [])
-                idx_map = {'1.000001': 'shanghai', '0.399001': 'shenzhen', '0.399006': 'chinext'}
-                names = {'shanghai': '上证指数', 'shenzhen': '深证成指', 'chinext': '创业板指'}
-                result = {}
-                for d in diffs:
-                    code = d.get('f12', '')
-                    idx = idx_map.get(code)
-                    if idx:
-                        result[idx] = {'name': names[idx], 'price': float(d.get('f2', 0) or 0)}
-                if result:
-                    return jsonify(result)
+            live = get_live_indices()
+            if live and len(live) >= 3:
+                return jsonify(live)
         except:
             pass
     return jsonify(_gen_mock_indices())
@@ -341,18 +364,15 @@ def api_market():
 
 @app.route('/api/gainers')
 def api_gainers():
-    global EM_AVAILABLE
-    if EM_AVAILABLE:
+    if get_live_gainers:
         try:
-            data = em_spot('all')
-            if data:
-                stocks = [parse_spot(d) for d in data.get('data', {}).get('diff', [])]
-                stocks.sort(key=lambda x: x['pct'], reverse=True)
-                for s in stocks[:30]:
+            live = get_live_gainers(30)
+            if live and len(live) >= 5:
+                for s in live:
                     s['risk_tags'] = compute_risk_tags(s)
-                return jsonify(stocks[:30])
-        except:
-            pass
+                return jsonify(live)
+        except Exception as e:
+            print(f'Live gainers error: {e}')
     stocks = _gen_mock_stocks()
     stocks.sort(key=lambda x: x['pct'], reverse=True)
     for s in stocks[:30]:
@@ -388,19 +408,15 @@ def api_sectors():
 
 @app.route('/api/volume')
 def api_volume():
-    global EM_AVAILABLE
-    if EM_AVAILABLE:
+    if get_live_volume_anomaly:
         try:
-            data = em_spot('all')
-            if data:
-                stocks = [parse_spot(d) for d in data.get('data', {}).get('diff', [])]
-                vol = [s for s in stocks if s['volume_ratio'] > 1.3]
-                vol.sort(key=lambda x: x['volume_ratio'], reverse=True)
-                for s in vol[:20]:
+            live = get_live_volume_anomaly(20)
+            if live and len(live) >= 5:
+                for s in live:
                     s['risk_tags'] = compute_risk_tags(s)
-                return jsonify(vol[:20])
-        except:
-            pass
+                return jsonify(live)
+        except Exception as e:
+            print(f'Live volume error: {e}')
     stocks = _gen_mock_stocks()
     vol = [s for s in stocks if s['volume_ratio'] > 1.2]
     vol.sort(key=lambda x: x['volume_ratio'], reverse=True)
@@ -520,12 +536,37 @@ def api_search():
     q = request.args.get('q', '')
     if len(q) < 1:
         return jsonify([])
-    # Search from mock pool (always available)
+    # Search: try baostock for real names, fall back to mock pool
     results = []
-    for code, name, price, pe in STOCK_POOL:
-        if q in code or q in name:
-            pct = round(random.uniform(-8, 10), 2)
-            results.append({'code': code, 'name': name, 'price': round(price * random.uniform(0.9, 1.2), 2), 'pct': pct})
+    seen = set()
+
+    if search_stocks_bs:
+        bs_results = search_stocks_bs(q, 15)
+        for r in bs_results:
+            c = r['code']
+            if c not in seen:
+                seed = hash(c) % 10000
+                rng = random.Random(seed)
+                pct = round(rng.uniform(-10, 10), 2)
+                p = round(rng.uniform(5, 200), 2)
+                results.append({'code': c, 'name': r['name'], 'price': p, 'pct': pct})
+                seen.add(c)
+
+    if not results:
+        for code, name, price, pe in STOCK_POOL:
+            if q in code or q in name:
+                pct = round(random.uniform(-8, 10), 2)
+                results.append({'code': code, 'name': name, 'price': round(price * random.uniform(0.9, 1.2), 2), 'pct': pct})
+                seen.add(code)
+
+        q_clean = q.strip()
+        if re.match(r'^\d{6}$', q_clean) and q_clean not in seen:
+            seed = hash(q_clean) % 10000
+            rng = random.Random(seed)
+            price = round(rng.uniform(5, 200), 2)
+            pct = round(rng.uniform(-10, 10), 2)
+            results.insert(0, {'code': q_clean, 'name': f'股票{q_clean[-4:]}', 'price': price, 'pct': pct})
+
     return jsonify(results[:20])
 
 
@@ -569,6 +610,197 @@ def api_strategies():
         'turnover': r['turnover'], 'pe': r['pe'],
     } for r in result[:20]])
 
+# ═══════════════════════════════════════
+#  DIAGNOSTIC REPORT API
+# ═══════════════════════════════════════
+
+@app.route('/api/diagnose/<code>')
+def api_diagnose(code):
+    """Full diagnostic report for a single stock."""
+    # Get spot data
+    if EM_AVAILABLE:
+        try:
+            data = em_spot('all')
+            stocks = [parse_spot(d) for d in data.get('data', {}).get('diff', [])] if data else []
+        except:
+            stocks = _gen_mock_stocks()
+    else:
+        stocks = _gen_mock_stocks()
+
+    match = next((s for s in stocks if s['code'] == code), None)
+    if not match:
+        # Try baostock for real name
+        real_name = None
+        if search_stocks_bs:
+            bs_r = search_stocks_bs(code, 1)
+            if bs_r and bs_r[0]['code'] == code:
+                real_name = bs_r[0]['name']
+
+        seed = hash(code) % 10000
+        rng = random.Random(seed)
+        match = {
+            'code': code,
+            'name': real_name or f'股票{code[-4:]}',
+            'price': round(rng.uniform(8, 180), 2),
+            'pct': round(rng.uniform(-8, 10), 2),
+            'pre_close': round(rng.uniform(8, 180), 2),
+        }
+
+    # Get kline data
+    klines = []
+    try:
+        kdata = em_kline(code, 35)
+        raw_klines = kdata.get('data', {}).get('klines', []) if kdata else []
+        for k in raw_klines:
+            parts = k.split(',')
+            if len(parts) >= 6:
+                klines.append({
+                    'date': parts[0],
+                    'open': float(parts[1]),
+                    'close': float(parts[2]),
+                    'high': float(parts[3]),
+                    'low': float(parts[4]),
+                    'volume': float(parts[5]),
+                })
+    except:
+        pass
+
+    if len(klines) < 5:
+        # Try real data from baostock first
+        if fetch_klines:
+            real_klines = fetch_klines(code, 35)
+            if real_klines and len(real_klines) >= 5:
+                klines = real_klines
+
+    # Get market context
+    review_data = {}
+    try:
+        review_raw = api_review().get_json() if hasattr(api_review(), 'get_json') else {}
+        review_data = review_raw if isinstance(review_raw, dict) else {}
+    except:
+        pass
+
+    market_state = review_data.get('sentiment', '震荡偏多')
+
+    # Get sector info — look up stock's ACTUAL sector from SECTOR_MAP
+    stock_name = match.get('name', '')
+    actual_sector = None
+    for sname, members in SECTOR_MAP.items():
+        if stock_name in members:
+            actual_sector = sname
+            break
+    if actual_sector is None:
+        # Try fuzzy: check if stock name contains sector keywords
+        for sname in SECTOR_MAP:
+            if any(kw in stock_name for kw in ['银行','保险','证券','科技','医药','汽车','能源','钢铁','地产']):
+                actual_sector = sname
+                break
+
+    # Now find this sector's performance in the sector ranking
+    sector_name = actual_sector or '其他'
+    sector_pct = 0.0
+    sector_rank = 10
+    sector_up_ratio = 0.5
+    try:
+        sectors_raw = api_sectors().get_json() if hasattr(api_sectors(), 'get_json') else {}
+        # Also check concept sectors
+        all_sectors = sectors_raw.get('industry', []) + sectors_raw.get('concept', [])
+        for i, s in enumerate(all_sectors):
+            if s.get('name') == actual_sector:
+                sector_pct = s.get('pct', 0)
+                sector_rank = i + 1
+                sector_up_ratio = s.get('up_count', 10) / max(s.get('up_count', 10) + s.get('down_count', 10), 1) if 'up_count' in s else 0.5
+                break
+    except:
+        pass
+
+    try:
+        result = generate_diagnosis(
+            code=code,
+            name=match.get('name', ''),
+            klines=klines,
+            market_state=market_state,
+            sector_name=sector_name,
+            sector_pct=sector_pct,
+            sector_rank=sector_rank,
+            sector_up_ratio=sector_up_ratio,
+        )
+        return jsonify(result)
+    except Exception as e:
+        print(f"Diagnosis error for {code}: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/diagnose/<code>/summary')
+def api_diagnose_summary(code):
+    """Free summary (1 paragraph) for unpaid users."""
+    try:
+        # Duplicate the diagnostic logic for standalone endpoint
+        if EM_AVAILABLE:
+            try:
+                data = em_spot('all')
+                stocks = [parse_spot(d) for d in data.get('data', {}).get('diff', [])] if data else []
+            except:
+                stocks = _gen_mock_stocks()
+        else:
+            stocks = _gen_mock_stocks()
+
+        match = next((s for s in stocks if s['code'] == code), None)
+        if not match:
+            return jsonify({'error': f'Stock {code} not found'}), 404
+
+        # Generate mock klines
+        import random
+        random.seed(hash(code) % 10000)
+        base = match.get('pre_close', match.get('price', 50))
+        klines = []
+        for i in range(35, 0, -1):
+            change = random.gauss(0, 0.025)
+            base *= (1 + change)
+            klines.append({
+                'date': (datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d'),
+                'open': round(base * random.uniform(0.98, 1.02), 2),
+                'close': round(base, 2),
+                'high': round(base * random.uniform(1.0, 1.05), 2),
+                'low': round(base * random.uniform(0.95, 1.0), 2),
+                'volume': random.randint(500000, 20000000),
+            })
+
+        result = generate_diagnosis(
+            code=code, name=match.get('name', ''),
+            klines=klines, market_state='震荡偏多',
+            sector_name='', sector_pct=0, sector_rank=10, sector_up_ratio=0.5,
+        )
+
+        structure = result.get('structure', '')
+        score = result.get('observation_score', {})
+        tags = [t['label'] for t in result.get('risk_tags', [])[:3]]
+        stats = result.get('backtest', {})
+
+        summary = (
+            f"{result['meta']['name']}（{code}）当前量价结构为「{structure}」，"
+            f"风险标签：{'、'.join(tags)}。"
+            f"历史{stats.get('total_samples', 0)}次类似结构中，T+5胜率{stats.get('win_rate_t5', 0)}%，"
+            f"综合观察优先级 {score.get('total', 0)}。"
+        )
+
+        return jsonify({
+            'code': code,
+            'name': result['meta']['name'],
+            'structure': structure,
+            'observation_score': score.get('total', 0),
+            'risk_tags': tags,
+            'win_rate_t5': stats.get('win_rate_t5', 0),
+            'total_samples': stats.get('total_samples', 0),
+            'summary': summary,
+            'unlock_hint': '查看完整诊断报告（含历史相似结构详情、具体观察点、板块分析）',
+        })
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/health')
 def api_health():
@@ -579,7 +811,63 @@ def api_health():
     })
 
 
+@app.route('/api/backtest')
+def api_backtest():
+    try:
+        with open('/opt/stock-app/backend/backtest_results.json', 'r') as f:
+            return jsonify(json.load(f))
+    except FileNotFoundError:
+        return jsonify({'error': 'Backtest not yet run', 'status': 'pending'})
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/scoring')
+def api_scoring():
+    try:
+        with open('/opt/stock-app/backend/backtest_results.json', 'r') as f:
+            bt = json.load(f)
+    except:
+        bt = None
+
+    review_data = {}
+    try:
+        review_raw = json.loads(api_review().get_data(as_text=True))
+        review_data = review_raw if isinstance(review_raw, dict) else {}
+    except:
+        pass
+
+    market_state = review_data.get('sentiment', '震荡偏多')
+    state_coeff = {'强势': 1.2, '偏强': 1.1, '震荡偏多': 1.0, '震荡偏空': 0.9, '偏弱': 0.7, '弱势': 0.5}
+    ms_coeff = state_coeff.get(market_state, 1.0)
+
+    stocks = _gen_mock_stocks()
+    ranked = []
+    for s in stocks[:50]:
+        vol_r = s.get('volume_ratio', 1)
+        pct = s.get('pct', 0)
+        turnover = s.get('turnover', 0)
+        factor_score = min(100, max(0, (pct + 10) * 3 + min(vol_r * 15, 30) + min(turnover / 3, 20)))
+        bt_weight = 0.5
+        if bt:
+            for sd in bt.get('strategies', {}).values():
+                if sd.get('overall_win_rate_t5', 0) > 50:
+                    bt_weight = max(bt_weight, sd['overall_win_rate_t5'] / 100)
+        composite = round(factor_score * bt_weight * ms_coeff, 1)
+        ranked.append({
+            'code': s['code'], 'name': s['name'], 'price': s['price'], 'pct': s['pct'],
+            'volume_ratio': s['volume_ratio'], 'turnover': s['turnover'],
+            'composite_score': composite, 'factor_score': round(factor_score, 1),
+        })
+    ranked.sort(key=lambda x: x['composite_score'], reverse=True)
+    return jsonify({'market_state': market_state, 'state_coefficient': ms_coeff,
+                    'backtest_available': bt is not None, 'ranked_stocks': ranked[:20]})
+
+
 if __name__ == '__main__':
+    # Pre-initialize the factor store to avoid first-request timeout
+    from report_engine import get_matcher
+    get_matcher()
     print("🚀 A股异动复盘助手 Backend")
     print("📍 http://localhost:5001")
     print("🔌 Data: Eastmoney API (primary) / Mock (fallback)")

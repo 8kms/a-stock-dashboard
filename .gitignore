@@ -4,3 +4,10 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
+.vite/
+*.html
+*.md
+*.pptx
+*.pyc
+__pycache__/
+
