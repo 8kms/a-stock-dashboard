@@ -167,7 +167,8 @@ STOCK_POOL = [
     ('688169', '石头科技', 325.0, 28.5), ('300413', '芒果超媒', 28.5, 32.0),
     ('002555', '三七互娱', 18.5, 15.0), ('603444', '吉比特', 285.0, 18.5),
     ('601066', '中信建投', 25.8, 28.0), ('600837', '海通证券', 9.85, 22.5),
-    ('000776', '广发证券', 15.8, 15.5), ('601211', '国泰君安', 15.2, 12.8),
+    ('000422', '湖北宜化', 12.5, 18.0), ('000776', '广发证券', 15.8, 15.5),
+    ('000301', '东方盛虹', 14.2, 22.0), ('601211', '国泰君安', 15.2, 12.8),
     ('002736', '国信证券', 10.5, 18.0), ('300803', '指南针', 85.0, 68.0),
     ('601878', '浙商证券', 12.5, 22.0), ('600999', '招商证券', 15.8, 15.5),
 ]
@@ -198,6 +199,7 @@ SECTOR_MAP = {
     '锂电池': ['宁德时代', '亿纬锂能', '赣锋锂业', '先导智能', '嘉元科技', '鼎胜新材', '容百科技'],
     '科创板': ['中芯国际', '中微公司', '金山办公', '澜起科技', '寒武纪', '嘉元科技', '容百科技'],
     '铝业': ['鼎胜新材', '中国铝业', '南山铝业', '明泰铝业'],
+    '化工': ['湖北宜化', '万华化学', '华鲁恒升', '东方盛虹'],
 }
 
 # Market state
@@ -540,32 +542,54 @@ def api_search():
     results = []
     seen = set()
 
-    if search_stocks_bs:
-        bs_results = search_stocks_bs(q, 15)
-        for r in bs_results:
-            c = r['code']
-            if c not in seen:
-                seed = hash(c) % 10000
+    # Primary: mock pool (instant) + dynamic code generation
+    for code, name, price, pe in STOCK_POOL:
+        if q in code or q in name:
+            pct = round(random.uniform(-8, 10), 2)
+            results.append({'code': code, 'name': name, 'price': round(price * random.uniform(0.9, 1.2), 2), 'pct': pct})
+            seen.add(code)
+
+    # Any 6-digit code gets generated on-the-fly
+    q_clean = q.strip()
+    if re.match(r'^\d{6}$', q_clean) and q_clean not in seen:
+        # Try baostock for real name (non-blocking, with fast path)
+        real_name = None
+        try:
+            from live_data import search_stocks_fast
+            fast = search_stocks_fast(q_clean, 1)
+            if fast and fast[0]['code'] == q_clean:
+                real_name = fast[0]['name']
+        except:
+            try:
+                if search_stocks_bs:
+                    bs_r = search_stocks_bs(q_clean, 1)
+                    if bs_r and bs_r[0]['code'] == q_clean:
+                        real_name = bs_r[0]['name']
+            except:
+                pass
+
+        seed = hash(q_clean) % 10000
+        rng = random.Random(seed)
+        price = round(rng.uniform(5, 200), 2)
+        pct = round(rng.uniform(-10, 10), 2)
+        results.insert(0, {'code': q_clean, 'name': real_name or f'股票{q_clean[-4:]}', 'price': price, 'pct': pct})
+
+    # Bonus: add more results from fast search if available
+    try:
+        from live_data import search_stocks_fast
+        fast = search_stocks_fast(q, 15)
+        for r in fast:
+            if r['code'] not in seen:
+                seed = hash(r['code']) % 10000
                 rng = random.Random(seed)
                 pct = round(rng.uniform(-10, 10), 2)
                 p = round(rng.uniform(5, 200), 2)
-                results.append({'code': c, 'name': r['name'], 'price': p, 'pct': pct})
-                seen.add(c)
-
-    if not results:
-        for code, name, price, pe in STOCK_POOL:
-            if q in code or q in name:
-                pct = round(random.uniform(-8, 10), 2)
-                results.append({'code': code, 'name': name, 'price': round(price * random.uniform(0.9, 1.2), 2), 'pct': pct})
-                seen.add(code)
-
-        q_clean = q.strip()
-        if re.match(r'^\d{6}$', q_clean) and q_clean not in seen:
-            seed = hash(q_clean) % 10000
-            rng = random.Random(seed)
-            price = round(rng.uniform(5, 200), 2)
-            pct = round(rng.uniform(-10, 10), 2)
-            results.insert(0, {'code': q_clean, 'name': f'股票{q_clean[-4:]}', 'price': price, 'pct': pct})
+                results.append({'code': r['code'], 'name': r['name'], 'price': p, 'pct': pct})
+                seen.add(r['code'])
+                if len(results) >= 20:
+                    break
+    except:
+        pass
 
     return jsonify(results[:20])
 
